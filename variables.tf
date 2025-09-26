@@ -15,6 +15,16 @@ variable "aws_region" {
     default = "us-east-1"
 }
 
+variable "key_name" {
+  description = "SSH key pair name for EC2"
+  type        = string
+}
+
+variable "tag_name" {
+  description = "Base Name tag for resources"
+  type        = string
+}
+
 variable "key_pair" {
     description = "Key pair used to login to the instance"
     default = "sshkeys"
