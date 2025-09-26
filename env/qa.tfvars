@@ -32,4 +32,6 @@ tags = {
   Project     = "acme-platform"
   Owner       = "platform-team"
   CostCenter  = "cc-1002"
+  key_name = "your-ec2-keypair-name"
+  tag_name = "dev-jenkins"
 }
