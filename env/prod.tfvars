@@ -33,4 +33,6 @@ tags = {
   Owner       = "platform-team"
   CostCenter  = "cc-1999"
   Confidentiality = "internal"
+  key_name = "your-ec2-keypair-name"
+  tag_name = "dev-jenkins"
 }
