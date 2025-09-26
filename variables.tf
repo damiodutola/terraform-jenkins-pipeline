@@ -17,11 +17,17 @@ variable "aws_region" {
 
 variable "key_pair" {
     description = "Key pair used to login to the instance"
+    default = "sshkeys"
 }
 
 variable "instance_type" { 
     description = "Instance type for the Jenkins server"
     default = "t3.medium"
+}
+
+variable "security_group" { 
+    description = "Name of security group" 
+    default     = "my-jenkins-security-group-apr-2025" 
 }
 
 variable "tfe_api_token" {
@@ -51,6 +57,11 @@ variable "owner" {
 variable "hc_region" {
     description = "Sales region"
     default = "NA-SOUTHEAST-ENT"
+}
+
+variable "ami_id" { 
+    description = "AMI for Ubuntu Ec2 instance" 
+    default     = "ami-0a7d80731ae1b2435" 
 }
 
 variable "purpose" {
