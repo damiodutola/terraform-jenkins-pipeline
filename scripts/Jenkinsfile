@@ -1,320 +1,203 @@
-#!groovy
-import groovy.json.JsonOutput
-import groovy.json.JsonSlurper
+// Jenkinsfile — Terraform IaC with env + action params and approvals
+// Repo layout (example):
+//   /infra/                 -> Terraform root
+//     main.tf
+//     versions.tf
+//     variables.tf
+//     backend.hcl           -> backend config (optional)
+//     vars/
+//       dev.tfvars
+//       qa.tfvars
+//       prod.tfvars
 
-node {
-    checkout()
-    build()
-    putBinary()
-    buildInfrastructure()
-}
+pipeline {
+  agent any
 
-def checkout() {
-    stage('Clone') {
-        git branch: 'master', url: 'https://github.com/kevincloud/javaperks-customer-api.git'
+  options {
+    // Avoid mixing runs; also lock per env later for job-level safety
+    disableConcurrentBuilds()
+    ansiColor('xterm')
+    buildDiscarder(logRotator(numToKeepStr: '25'))
+    timestamps()
+  }
+
+  parameters {
+    choice(name: 'ENV', choices: ['dev', 'qa', 'prod'], description: 'Target environment (Terraform workspace & tfvars).')
+    choice(name: 'ACTION', choices: ['plan', 'apply', 'destroy'], description: 'Terraform action to perform.')
+    string(name: 'TF_DIR', defaultValue: 'infra', description: 'Relative path to Terraform root.')
+    string(name: 'TF_VERSION', defaultValue: '1.7.5', description: 'Terraform version installed on the agent (or tool name).')
+    booleanParam(name: 'REFRESH', defaultValue: true, description: 'Run plan with -refresh=true.')
+    string(name: 'EXTRA_ARGS', defaultValue: '', description: 'Extra args to append to plan/apply/destroy (e.g., -target=module.foo).')
+  }
+
+  environment {
+    // Example: AWS credentials ID, or use Azure/GCP blocks instead.
+    // Replace with your Jenkins Credentials IDs.
+    CLOUD_CREDS_ID = 'aws-prod-ro'   // Swap per your setup
+    // Optional: Terraform tool installation if using Jenkins "Global Tool Configuration"
+    // TF_TOOL = tool name: 'Terraform_1_7_5'
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scmGit(branches: [[name: '*/master']], extensions: [], userRemoteConfigs: [[credentialsId: 'a51f1f5d-733a-435f-8d64-89c695a2b829', url: 'https://github.com/damiodutola/terraform-jenkins-pipeline']])
+      }
     }
-}
 
-def build() {
-    stage('Build') {
-        mvn 'package'
-    }
-}
-
-def putBinary() {
-    stage('Upload Binary') {
-        def fileName = ""
-        def fullPath = ""
-        Collection<org.jenkinsci.plugins.pipeline.maven.MavenArtifact> generatedArtifacts = currentBuild.rawBuild.getAction(org.jenkinsci.plugins.pipeline.maven.publishers.MavenReport.class).getGeneratedArtifacts();
-        for (org.jenkinsci.plugins.pipeline.maven.MavenArtifact generatedArtifact:generatedArtifacts) {
-            fileName = generatedArtifact.getFileName();
-            println(fileName)
-            println("--------")
-            break
+    stage('Setup Terraform') {
+      steps {
+        dir(params.TF_DIR) {
+          sh """
+            terraform -version || true
+          """
+          // Optional: validate fmt early
+          sh """
+            terraform fmt -check -recursive || true
+            terraform init -input=false $( [ -f backend.hcl ] && echo "-backend-config=backend.hcl" )
+          """
         }
+      }
+    }
 
-        // TODO: Fix region
-        fullPath = env.WORKSPACE + "/target/" + fileName
-        // withAWS(credentials:'pipeline-credentials', region: env.AWS_REGION) {
-        //     s3Upload(bucket: env.ASSET_BUCKET, file: fullPath, path: fileName)
-        // }
-        withAWS(region: env.AWS_REGION) {
-            s3Upload(bucket: env.ASSET_BUCKET, file: fullPath, path: fileName)
+    stage('Select/Create Workspace') {
+      steps {
+        dir(params.TF_DIR) {
+          sh """
+            terraform workspace list >/dev/null 2>&1 || terraform workspace new default || true
+            terraform workspace select ${params.ENV} >/dev/null 2>&1 || terraform workspace new ${params.ENV}
+            echo "Using workspace: $(terraform workspace show)"
+          """
         }
+      }
     }
-}
 
-def buildInfrastructure() {
-    stage('Run Terraform') {
-        def runid = ""
-        getWorkspaceId()
-        buildPayload()
-
-        runid = startPlan()
-
-        waitForPlan(runid)
+    stage('Validate') {
+      steps {
+        dir(params.TF_DIR) {
+          sh 'terraform validate -no-color'
+        }
+      }
     }
-}
 
-def getWorkspaceId() {
-    def response = httpRequest(
-        customHeaders: [
-                [ name: "Authorization", value: "Bearer " + env.BEARER_TOKEN ], 
-                [ name: "Content-Type", value: "application/vnd.api+json" ]
-            ],
-        url: "https://app.terraform.io/api/v2/organizations/" + env.TF_ORGNAME + "/workspaces/" + env.TF_WORKSPACE
-    )
-    
-    def data = new JsonSlurper().parseText(response.content)
-    println ("Workspace Id: " + data.data.id)
-    return data.data.id
-}
+    stage('Plan') {
+      when { anyOf { expression { params.ACTION == 'plan' }; expression { params.ACTION == 'apply' }; expression { params.ACTION == 'destroy' } } }
+      steps {
+        dir(params.TF_DIR) {
+          script {
+            def refresh = params.REFRESH ? "-refresh=true" : "-refresh=false"
+            def tfvars = "vars/${params.ENV}.tfvars"
+            def destroyFlag = (params.ACTION == 'destroy') ? "-destroy" : ""
+            sh """
+              terraform plan -no-color ${destroyFlag} \\
+                -input=false \\
+                ${refresh} \\
+                -var-file=${tfvars} \\
+                ${params.EXTRA_ARGS} \\
+                -out=tfplan
+            """
+          }
+        }
+      }
+      post {
+        success {
+          archiveArtifacts artifacts: "${params.TF_DIR}/tfplan", fingerprint: true
+        }
+      }
+    }
 
-def buildPayload() {
-    def wsid = getWorkspaceId()
-    def payload = """
-{
-    "data": {
-        "attributes": {
-            "is-destroy":false,
-            "message": "Triggered run from Jenkins (build #${env.BUILD_NUMBER})"
-        },
-        "type":"runs",
-        "relationships": {
-            "workspace": {
-                "data": {
-                    "type": "workspaces",
-                    "id": "${wsid}"
-                }
+    // --- Approval gates per environment ---
+    stage('Approve DEV') {
+      when { allOf { expression { params.ENV == 'dev' }; anyOf { expression { params.ACTION == 'apply' }; expression { params.ACTION == 'destroy' } } } }
+      steps {
+        script {
+          timeout(time: 2, unit: 'HOURS') {
+            def resp = input(
+              id: 'DevApproval',
+              message: "Approve ${params.ACTION.toUpperCase()} for DEV?",
+              submitter: 'dev-approvers,team-leads', // Jenkins user/group names
+              parameters: [
+                string(name: 'CONFIRM', defaultValue: '', description: "Type dev to confirm."),
+              ]
+            )
+            if (resp?.CONFIRM?.trim() != 'dev') {
+              error "Confirmation failed. Expected 'dev'."
             }
+          }
         }
+      }
     }
-}
-    """
-    return payload
-}
 
-def startPlan() {
-    def payload = buildPayload()
-    def response = httpRequest(
-        customHeaders: [
-                [ name: "Authorization", value: "Bearer " + env.BEARER_TOKEN ], 
-                [ name: "Content-Type", value: "application/vnd.api+json" ]
-            ],
-        httpMode: 'POST',
-        requestBody: "${payload}",
-        url: "https://app.terraform.io/api/v2/runs"
-    )
-    def data = new JsonSlurper().parseText(response.content)
-    println ("Run Id: " + data.data.id)
-    return data.data.id
-}
-
-def waitForPlan(runid) {
-    def count = 0
-    while (true) {
-        def status = getPlanStatus(runid)
-        println("Status: " + status)
-
-        // If a policy requires an override, prompt in the pipeline
-        if (status.startsWith("approve_policy")) {
-            def override
-            try {
-                override = input (message: 'Override policy?', 
-                                  ok: 'Continue', 
-                                  parameters: [ booleanParam(
-                                      defaultValue: false,
-                                      description: 'A policy restriction is enforced on this workspace. Check the box to approve overriding the policy.', 
-                                      name: 'Override')
-                                  ])
-            } catch (err) {
-                override = false
+    stage('Approve QA') {
+      when { allOf { expression { params.ENV == 'qa' }; anyOf { expression { params.ACTION == 'apply' }; expression { params.ACTION == 'destroy' } } } }
+      steps {
+        script {
+          timeout(time: 4, unit: 'HOURS') {
+            def resp = input(
+              id: 'QaApproval',
+              message: "Approve ${params.ACTION.toUpperCase()} for QA?",
+              submitter: 'qa-approvers,qa-leads',
+              parameters: [
+                string(name: 'CONFIRM', defaultValue: '', description: "Type qa to confirm."),
+              ]
+            )
+            if (resp?.CONFIRM?.trim() != 'qa') {
+              error "Confirmation failed. Expected 'qa'."
             }
-
-            // If we're overriding, tell terraform. Otherwise, discard the run
-            if (override == true) {
-                println('Overriding!')
-                def item = status.split(':')[1]
-
-                def overridden = overridePolicy(item)
-                if (!overridden) {
-                    println("Could not override the policy")
-                    discardRun(runid)
-                    error("Could not override the Sentinel policy")
-                    break
-                }
-            } else {
-                println('Rejecting!')
-                discardRun(runid)
-                error("The pipeline failed due to a Sentinel policy restriction.")
-                break
-            }
+          }
         }
+      }
+    }
 
-        // If we're ready to apply, prompt in the pipeline to do so
-        if (status == "apply_plan") {
-            def apply
-            try {
-                apply = input (message: 'Confirm Apply', ok: 'Continue', 
-                                    parameters: [booleanParam(defaultValue: false,
-                                    description: 'Would you like to continue to apply this run?', name: 'Apply')])
-            } catch (err) {
-                apply = false
-            }
-
-            // If we're going to apply, tell Terraform. Otherwise, discard the run
-            if (apply == true) {
-                println('Applying plan')
-                applyRun(runid)
-            }
-            else {
-                println('Rejecting!')
-                discardRun(runid)
-                error("The pipeline failed due to a manual rejection of the plan.")
-                break
-            }
+    stage('Approve PROD') {
+      when { allOf { expression { params.ENV == 'prod' }; anyOf { expression { params.ACTION == 'apply' }; expression { params.ACTION == 'destroy' } } } }
+      steps {
+        script {
+          timeout(time: 24, unit: 'HOURS') {
+            def resp = input(
+              id: 'ProdApproval',
+              message: "FINAL APPROVAL: ${params.ACTION.toUpperCase()} for PROD",
+              submitter: 'prod-approvers,change-advisory-board', // tighten for prod
+              parameters: [
+                string(name: 'CHANGE_ID', defaultValue: '', description: 'Enter Change Request ID'),
+                string(name: 'CONFIRM',    defaultValue: '', description: "Type prod to confirm."),
+              ]
+            )
+            if (!resp?.CHANGE_ID?.trim()) { error "Change ID required for PROD." }
+            if (resp?.CONFIRM?.trim() != 'prod') { error "Confirmation failed. Expected 'prod'." }
+            currentBuild.displayName = "#${env.BUILD_NUMBER} ${params.ACTION.toUpperCase()} ${params.ENV} CR:${resp.CHANGE_ID}"
+          }
         }
-        if (count > 60) break
-        count++
-        sleep(2)
+      }
     }
-}
 
-def waitforApply(runid) {
-    def count = 0
-    while (true) {
-        def status = getApplyStatus(runid)
-        println("Status: " + status)
-
-        if (status == 'discarded') {
-            println("This run has been discarded")
-            error("The Terraform run has been discarded, and the pipeline cannot continue.")
-            break
+    // --- Apply / Destroy with per-env locking ---
+    stage('Apply / Destroy') {
+      when { anyOf { expression { params.ACTION == 'apply' }; expression { params.ACTION == 'destroy' } } }
+      options { lock(resource: "tf-${params.ENV}", inversePrecedence: true) }
+      steps {
+        dir(params.TF_DIR) {
+          withCredentials([
+            // Example: AWS. Replace with your cloud credentials.
+            [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.CLOUD_CREDS_ID]
+          ]) {
+            sh """
+              # Use the saved plan (ensures what was reviewed is what gets applied)
+              terraform apply -no-color -input=false tfplan
+            """
+          }
         }
-        if (status == 'canceled') {
-            println("This run has been canceled outside the pipeline")
-            error("The Terraform run has been canceled outside the pipeline, and the pipeline cannot continue.")
-            break
-        }
-        if (status == 'errored') {
-            println("This run has encountered an error while applying")
-            error("The Terraform run has encountered an error while applying, and the pipeline cannot continue.")
-            break
-        }
-        if (status == 'applied') {
-            println("This run has finished applying")
-            break
-        }
-
-        if (count > 60) break
-        count++
-        sleep(2)
+      }
     }
-}
+  }
 
-def applyRun(runid) {
-    def response = httpRequest(
-        customHeaders: [
-                [ name: "Authorization", value: "Bearer " + env.BEARER_TOKEN ], 
-                [ name: "Content-Type", value: "application/vnd.api+json" ]
-            ],
-        httpMode: 'POST',
-        responseBody: '{ comment: "Apply confirmed" }',
-        url: "https://app.terraform.io/api/v2/runs/${runid}/actions/apply"
-    )
-}
-
-def discardRun(runid) {
-    def response = httpRequest(
-        customHeaders: [
-                [ name: "Authorization", value: "Bearer " + env.BEARER_TOKEN ], 
-                [ name: "Content-Type", value: "application/vnd.api+json" ]
-            ],
-        httpMode: 'POST',
-        responseBody: '{ comment: "Run has been discarded" }',
-        url: "https://app.terraform.io/api/v2/runs/${runid}/actions/discard"
-    )
-}
-
-def overridePolicy(policyid) {
-    def response = httpRequest(
-        customHeaders: [
-                [ name: "Authorization", value: "Bearer " + env.BEARER_TOKEN ], 
-                [ name: "Content-Type", value: "application/vnd.api+json" ]
-            ],
-        httpMode: 'POST',
-        url: "https://app.terraform.io/api/v2/policy-checks/${policyid}/actions/override"
-    )
-
-    def data = new JsonSlurper().parseText(response.content)
-    if (data.data.attributes.status != "overridden") {
-        return false
+  post {
+    always {
+      dir(params.TF_DIR) {
+        sh 'terraform workspace show || true'
+      }
+      cleanWs(cleanWhenAborted: true, deleteDirs: true)
     }
-    else {
-        return true
-    }
-}
-
-def getPlanStatus(runid) {
-    def result = ""
-    def response = httpRequest(
-        customHeaders: [[ name: "Authorization", value: "Bearer " + env.BEARER_TOKEN ]],
-        url: "https://app.terraform.io/api/v2/runs/${runid}"
-    )
-    def data = new JsonSlurper().parseText(response.content)
-    switch (data.data.attributes.status) {
-        case 'pending':
-        case 'plan_queued':
-            result = "pending"
-            break
-        case 'planning':
-            result = "planning"
-            break
-        case 'planned':
-            result = "planned"
-            break
-        case 'cost_estimating':
-        case 'cost_estimated':
-            result = "costing"
-            break
-        case 'policy_checking':
-            result = "policy"
-            break
-        case 'policy_override':
-            println(response.content)
-            result = "approve_policy:" + data.data.relationships["policy-checks"].data[0].id
-            break
-        case 'policy_checked':
-            result = "apply_plan"
-            break
-        default:
-            result = "running"
-            break
-    }
-    return result
-}
-
-def getApplyStatus(runid) {
-    def result = ""
-    def response = httpRequest(
-        customHeaders: [[ name: "Authorization", value: "Bearer " + env.BEARER_TOKEN ]],
-        url: "https://app.terraform.io/api/v2/runs/${runid}"
-    )
-    def data = new JsonSlurper().parseText(response.content)
-    switch (data.data.attributes.status) {
-        case 'discarded':
-        case 'errored':
-        case 'canceled':
-            result = data.data.attributes.status
-            break
-        default:
-            result = "pending"
-    }
-    return result
-}
-
-def mvn(args) {
-    withMaven() {
-        sh "mvn $args"
-    }
+  }
 }
