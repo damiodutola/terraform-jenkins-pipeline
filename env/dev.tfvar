@@ -1,1 +1,37 @@
+# ---- Core ----
+environment        = "dev"
+project_name       = "acme-platform"
+region             = "us-east-1"
 
+# ---- Networking ----
+vpc_cidr           = "10.10.0.0/16"
+public_subnets     = ["10.10.1.0/24", "10.10.2.0/24"]
+private_subnets    = ["10.10.11.0/24", "10.10.12.0/24"]
+
+# ---- Compute ----
+instance_type      = "t3.small"
+min_size           = 1
+desired_capacity   = 1
+max_size           = 2
+
+# ---- Database (non-prod sizing) ----
+db_engine               = "postgres"
+db_engine_version       = "15"
+db_instance_class       = "db.t3.micro"
+db_allocated_storage_gb = 20
+db_name                 = "acme_dev"
+# db_username and db_password should come from Jenkins as sensitive -var or TF_VAR_*
+# db_username          = var from Jenkins
+# db_password          = var from Jenkins
+
+# ---- Feature Flags ----
+enable_alarms      = false
+enable_backup      = false
+
+# ---- Tags ----
+tags = {
+  Environment = "dev"
+  Project     = "acme-platform"
+  Owner       = "platform-team"
+  CostCenter  = "cc-1001"
+}
